@@ -106,6 +106,12 @@ PROMETHEUS_SUBSCRIPTION_CHANNEL=$(PROMETHEUS_SUBSCRIPTION_CHANNEL)
 PROMETHEUS_SUBSCRIPTION_STARTINGCSV=$(PROMETHEUS_SUBSCRIPTION_STARTINGCSV)
 PROMETHEUS_SUBSCRIPTION_CATALOGSOURCE=$(PROMETHEUS_SUBSCRIPTION_CATALOGSOURCE)
 PROMETHEUS_SUBSCRIPTION_CATALOGSOURCE_NAMESPACE=$(PROMETHEUS_SUBSCRIPTION_CATALOGSOURCE_NAMESPACE)
+RECIPE_SUBSCRIPTION_NAME=$(RECIPE_SUBSCRIPTION_NAME)
+RECIPE_SUBSCRIPTION_PACKAGE=$(RECIPE_SUBSCRIPTION_PACKAGE)
+RECIPE_SUBSCRIPTION_CHANNEL=$(RECIPE_SUBSCRIPTION_CHANNEL)
+RECIPE_SUBSCRIPTION_STARTINGCSV=$(RECIPE_SUBSCRIPTION_STARTINGCSV)
+RECIPE_SUBSCRIPTION_CATALOGSOURCE=$(RECIPE_SUBSCRIPTION_CATALOGSOURCE)
+RECIPE_SUBSCRIPTION_CATALOGSOURCE_NAMESPACE=$(RECIPE_SUBSCRIPTION_CATALOGSOURCE_NAMESPACE)
 endef
 export MANAGER_ENV_VARS
 
@@ -135,6 +141,9 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/crd | kubectl delete -f -
+
+install-odf: operator-sdk ## install odf using the hack/install-odf.sh script
+	hack/install-odf.sh $(OPERATOR_SDK) $(BUNDLE_IMG) $(CATALOG_DEPS_IMG) $(STARTING_CSVS)
 
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
@@ -189,6 +198,7 @@ catalog: opm ## Generate catalog manifests and then validate generated files.
 	$(OPM) render --output=yaml $(CSIADDONS_BUNDLE_IMG) $(OPM_RENDER_OPTS) > catalog/csiaddons.yaml
 	$(OPM) render --output=yaml $(ROOK_BUNDLE_IMG) $(OPM_RENDER_OPTS) > catalog/rook.yaml
 	$(OPM) render --output=yaml $(PROMETHEUS_BUNDLE_IMG) $(OPM_RENDER_OPTS) > catalog/prometheus.yaml
+	$(OPM) render --output=yaml $(RECIPE_BUNDLE_IMG) $(OPM_RENDER_OPTS) > catalog/recipe.yaml
 	$(OPM) validate catalog
 
 .PHONY: catalog-build
@@ -198,3 +208,11 @@ catalog-build: catalog ## Build a catalog image.
 .PHONY: catalog-push
 catalog-push: ## Push a catalog image.
 	$(MAKE) docker-push IMG=$(CATALOG_IMG)
+
+.PHONY: catalog-deps-build
+catalog-deps-build: catalog ## Build a catalog-deps image.
+	docker build -f catalog.deps.Dockerfile -t $(CATALOG_DEPS_IMG) .
+
+.PHONY: catalog-deps-push
+catalog-deps-push: ## Push a catalog-deps image.
+	$(MAKE) docker-push IMG=$(CATALOG_DEPS_IMG)
