@@ -3,191 +3,140 @@
 set -e
 
 # Define the age threshold in hours
-AGE=6
+AGE=5
+THRESHOLD_DATE=$(date -u -d "${AGE} hours ago" +"%Y-%m-%dT%H:%M:%SZ")
 
-# Calculate age in hours from given time
-calculate_age() {
-    local launch_time=$1
+AGE_S3=24
+THRESHOLD_DATE_S3=$(date -u -d "${AGE_S3} hours ago" +"%Y-%m-%dT%H:%M:%SZ")
 
-    # Get the current time in ISO 8601 format
-    current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+command -v aws > /dev/null || { echo "Error: Install aws"; exit 1; }
+command -v jq > /dev/null || { echo "Error: Install jq"; exit 1; }
+command -v xargs > /dev/null || { echo "Error: Install xargs"; exit 1; }
 
-    # Calculate the difference in seconds
-    age_seconds=$(($(date -d "$current_time" +%s) - $(date -d "$launch_time" +%s)))
+filter_instances() {
+    local json=$1
 
-    # Convert seconds to hours
-    age_hours=$((age_seconds / 3600))
-
-    # Return the age in hours
-    echo "$age_hours"
+    jq -r --arg threshold "$THRESHOLD_DATE" '
+        .Reservations[]?.Instances[]?
+        | select(.LaunchTime <= $threshold)
+        | select(.Tags // [] | any(.Key == "createdBy" and .Value == "gh-openshift-ci"))
+        | .InstanceId
+    ' <<< "$json"
 }
 
-# Delete the instance older than AGE
-delete_ec2_instance() {
-    local region=$1
-    local instance_id=$2
+filter_volumes() {
+    local json=$1
 
-    # This instance was created by a unidentified user as "Fedora 38" and the cleanup process fails with the following error.
-    # The instance 'i-05a66fffafaa219f5' may not be terminated. Modify its 'disableApiTermination' instance attribute and try again.
-    if [[ "$instance_id" == "i-05a66fffafaa219f5" ]]; then
-        return
-    fi
-
-    # Get the launch time of the instance
-    launch_time=$(aws ec2 describe-instances --region "$region" --instance-ids "$instance_id" \
-        --query "Reservations[*].Instances[*].{LaunchTime:LaunchTime}" --output text)
-
-    # If launch_time is empty return
-    [[ -z "$launch_time" ]] && return
-
-    age_hours=$(calculate_age "$launch_time")
-
-    # Delete the instance if older than AGE
-    if [ "$age_hours" -gt "$AGE" ]; then
-        echo "Deleting the instance $instance_id in region $region with launch time $launch_time"
-        aws ec2 terminate-instances --region "$region" --instance-ids "$instance_id"
-    fi
+    jq -r --arg threshold "$THRESHOLD_DATE" '
+        .Volumes[]?
+        | select(.CreateTime <= $threshold)
+        | select(.State == "available")
+        | select(.Tags // [] | any(
+            .Key == "createdBy" and .Value == "gh-openshift-ci" or
+            .Key == "kubernetes.io/created-for/pvc/namespace" and .Value == "openshift-storage" or
+            .Key == "kubernetes.io/created-for/pvc/namespace" and .Value == "openshift-monitoring"
+        ))
+        | .VolumeId
+    ' <<< "$json"
 }
 
-# Delete the volume older than AGE
-delete_ec2_volume() {
-    local region=$1
-    local volume_id=$2
+filter_nat_gateways() {
+    local json=$1
 
-    # Get the create time of the volume
-    create_time=$(aws ec2 describe-volumes --region "$region" --volume-ids "$volume_id" \
-        --query "Volumes[*].{CreateTime:CreateTime}" --output text)
-
-    # If create_time is empty return
-    [[ -z "$create_time" ]] && return
-
-    age_hours=$(calculate_age "$create_time")
-
-    # Delete the volume if older than AGE
-    if [ "$age_hours" -gt "$AGE" ]; then
-        echo "Deleting the volume $volume_id in region $region with create time $create_time"
-        aws ec2 delete-volume --region "$region" --volume-id "$volume_id"
-    fi
+    jq -r --arg threshold "$THRESHOLD_DATE" '
+        .NatGateways[]?
+        | select(.CreateTime <= $threshold)
+        | select(.State == "available")
+        | select(.Tags // [] | any(.Key == "createdBy" and .Value == "gh-openshift-ci"))
+        | .NatGatewayId
+    ' <<< "$json"
 }
 
-# Delete the nat gateway older than AGE
-delete_ec2_nat_gateway() {
-    local region=$1
-    local nat_gateway_id=$2
+filter_network_interfaces() {
+    local json=$1
 
-    # Get the create time of the nat gateway
-    create_time=$(aws ec2 describe-nat-gateways --region "$region" --nat-gateway-ids "$nat_gateway_id" \
-        --query "NatGateways[*].{CreateTime:CreateTime}" --output text)
-
-    # If create_time is empty return
-    [[ -z "$create_time" ]] && return
-
-    age_hours=$(calculate_age "$create_time")
-
-    # Delete the nat gateway if older than AGE
-    if [ "$age_hours" -gt "$AGE" ]; then
-        echo "Deleting the nat gateway $nat_gateway_id in region $region with create time $create_time"
-        aws ec2 delete-nat-gateway --region "$region" --nat-gateway-id "$nat_gateway_id"
-    fi
+    jq -r '
+        .NetworkInterfaces[]?
+        | select(.Status == "available")
+        | select(.TagSet // [] | any(.Key == "createdBy" and .Value == "gh-openshift-ci"))
+        | .NetworkInterfaceId
+    ' <<< "$json"
 }
 
-# Delete the load balancer older than AGE
-delete_elb_load_balancer() {
-    local region=$1
-    local load_balancer_arn=$2
+filter_s3_buckets() {
+    local json=$1
 
-    # Get the created time of the load balancer
-    created_time=$(aws elbv2 describe-load-balancers --region "$region" --load-balancer-arn "$load_balancer_arn" \
-        --query "LoadBalancers[*].{CreatedTime:CreatedTime}" --output text)
-
-    # If created_time is empty return
-    [[ -z "$created_time" ]] && return
-
-    age_hours=$(calculate_age "$created_time")
-
-    # Delete the load balancer if older than AGE
-    if [ "$age_hours" -gt "$AGE" ]; then
-        echo "Deleting the load balancer $load_balancer_arn in region $region with created time $created_time"
-        aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn "$load_balancer_arn"
-    fi
+    jq -r --arg threshold "$THRESHOLD_DATE_S3" '
+        .Buckets[]?
+        | select(.CreationDate <= $threshold)
+        | select(.Name | startswith("nb"))
+        | .Name
+    ' <<< "$json"
 }
 
-# Delete the s3 bucket older than AGE
-delete_s3_bucket() {
-    local region=$1
-    local s3_bucket_name=$2
+filter_load_balancers() {
+    local json_age=$1
+    local json_tags=$2
 
-    # Get the creation date of the s3 bucket
-    creation_date=$(aws s3api list-buckets --region "$region" \
-        --query "Buckets[?Name=='$s3_bucket_name'].{CreationDate:CreationDate}" --output text)
+    local arns_age=$(jq -c --arg threshold "$THRESHOLD_DATE" '
+        [
+            .LoadBalancers[]?
+            | select(.CreatedTime <= $threshold)
+            | .LoadBalancerArn
+        ]
+    ' <<< "$json_age")
 
-    # If creation_date is empty return
-    [[ -z "$creation_date" ]] && return
+    local arns_tags=$(jq -c '
+        [
+            .ResourceTagMappingList[]?
+            | select(.Tags // [] | any(.Key == "createdBy" and .Value == "gh-openshift-ci"))
+            | .ResourceARN
+        ]
+    ' <<< "$json_tags")
 
-    age_hours=$(calculate_age "$creation_date")
-
-    # Delete the s3 bucket if older than AGE
-    if [ "$age_hours" -gt "$AGE" ]; then
-        echo "Deleting the s3 bucket $s3_bucket_name in region $region with creation date $creation_date"
-        aws s3 rb s3://"$s3_bucket_name" --region "$region" --force
-    fi
+    # Filter common
+    jq -n -r --argjson arr1 "$arns_age" --argjson arr2 "$arns_tags" '
+        ($arr1 - ($arr1 - $arr2))[]
+    '
 }
-
 
 for region in us-east-1 us-east-2 us-west-1 us-west-2; do
-    # List ec2 instances which are running
-    for instance_id in $(aws ec2 describe-instances --region "$region" \
-        --query "Reservations[*].Instances[?State.Name=='running'].InstanceId" --output text); do
 
-        delete_ec2_instance "$region" "$instance_id"
-    done
+    echo List and Filter instances in $region
+    instances=$(aws ec2 describe-instances --region "$region" --output json)
+    filtered_instances=$(filter_instances "$instances")
+    echo "$filtered_instances"
+    echo "$filtered_instances" | xargs -I {} aws ec2 terminate-instances --region "$region" --instance-ids {}
 
-    # List ec2 volumes which are available
-    for volume_id in $(aws ec2 describe-volumes --region "$region" \
-        --query "Volumes[?State=='available'].VolumeId" --output text); do
+    echo List and Filter volumes in $region
+    volumes=$(aws ec2 describe-volumes --region "$region" --output json)
+    filtered_volumes=$(filter_volumes "$volumes")
+    echo "$filtered_volumes"
+    echo "$filtered_volumes" | xargs -I {} aws ec2 delete-volume --region "$region" --volume-id {}
 
-        delete_ec2_volume "$region" "$volume_id"
-    done
+    echo List and Filter nat gateways in $region
+    nat_gateways=$(aws ec2 describe-nat-gateways --region "$region" --output json)
+    filtered_nat_gateways=$(filter_nat_gateways "$nat_gateways")
+    echo "$filtered_nat_gateways"
+    echo "$filtered_nat_gateways" | xargs -I {} aws ec2 delete-nat-gateway --region "$region" --nat-gateway-id {}
 
-    # List elb load balancer
-    for load_balancer_arn in $(aws elbv2 describe-load-balancers --region "$region" \
-        --query "LoadBalancers[*].LoadBalancerArn" --output text); do
+    echo List and Filter network interfaces in $region
+    network_interfaces=$(aws ec2 describe-network-interfaces --region "$region" --output json)
+    filtered_network_interfaces=$(filter_network_interfaces "$network_interfaces")
+    echo "$filtered_network_interfaces"
+    echo "$filtered_network_interfaces" | xargs -I {} aws ec2 delete-network-interface --region "$region" --network-interface-id {}
 
-        delete_elb_load_balancer "$region" "$load_balancer_arn"
-    done
-
-    # List ec2 nat gateways which are available
-    for nat_gateway_id in $(aws ec2 describe-nat-gateways --region "$region" \
-        --query "NatGateways[?State=='available'].NatGatewayId" --output text); do
-
-        delete_ec2_nat_gateway "$region" "$nat_gateway_id"
-    done
-
-    # List ec2 network interfaces which are available
-    for network_interface_id in $(aws ec2 describe-network-interfaces --region "$region" \
-        --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" --output text); do
-
-        # Delete the ec2 network interfaces which are available
-        echo "Deleting the network interface $network_interface_id in region $region"
-        aws ec2 delete-network-interface --region "$region" --network-interface-id "$network_interface_id"
-    done
-
-    # TODO implement VPC deletion as per https://docs.aws.amazon.com/vpc/latest/userguide/delete-vpc.html
-    # List ec2 vpc which are available except default
-    #for vpc_id in $(aws ec2 describe-vpcs --region "$region" \
-    #    --query "Vpcs[?State=='available'].VpcId" --filters "Name=isDefault,Values=false" --output text); do
-
-    #    # Delete the ec2 vpc which are available except default
-    #    echo "Deleting the vpc $vpc_id in region $region"
-    #    aws ec2 delete-vpc --region "$region" --vpc-id "$vpc_id"
-    #done
-
-    # List s3 buckets starting with nb that belongs to noobaa
-    for bucket_name in $(aws s3api list-buckets --region "$region" \
-        --query "Buckets[?starts_with(Name, 'nb')].Name" --output text); do
-
-        # Delete the s3 buckets starting with nb
-        delete_s3_bucket "$region" "$bucket_name"
-    done
+    echo List and Filter load balancers in $region
+    load_balancers=$(aws elbv2 describe-load-balancers --region "$region" --output json)
+    load_balancers_tags=$(aws resourcegroupstaggingapi get-resources --resource-type-filters elasticloadbalancing:loadbalancer --region "$region" --output json)
+    filtered_load_balancers=$(filter_load_balancers "$load_balancers" "$load_balancers_tags")
+    echo "$filtered_load_balancers"
+    echo "$filtered_load_balancers" | xargs -I {} aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn {}
 
 done
+
+echo List and Filter s3 buckets in $region
+s3_buckets=$(aws s3api list-buckets --output json)
+filtered_s3_buckets=$(filter_s3_buckets "$s3_buckets")
+echo "$filtered_s3_buckets"
+echo "$filtered_s3_buckets" | xargs -I {} aws s3 rb s3://{} --force
